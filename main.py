@@ -19,6 +19,10 @@ from OpenGL.GL import *
 from OpenGL.GLU import gluPerspective, gluLookAt
 from matplotlib import cm
 
+
+CONTROL_PANEL_WIDTH_OPEN = 200
+CONTROL_PANEL_WIDTH_CLOSED = 30
+
 # --- Helper: Generate Efficient Sphere Mesh ---
 def create_sphere_mesh_fast(radius, slices, stacks):
     vertices = []
@@ -417,10 +421,34 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(cw)
         layout = QHBoxLayout(cw)
         self.glw = FPSGLWidget(self)
-        layout.addWidget(self.glw, stretch=2)
+        layout.addWidget(self.glw)
 
-        ctrl = QVBoxLayout()
-        layout.addLayout(ctrl, stretch=1)
+        self.control_panel = QWidget()
+
+        ctrl = QVBoxLayout(self.control_panel)
+        ctrl.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(self.glw)
+        layout.addWidget(self.control_panel)
+        self.placeholder_label = QLabel("Select files in menu", self.glw)
+        self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder_label.setStyleSheet("""
+            QLabel {
+                color: #aaaaaa;
+                font-size: 24px;
+                background: transparent;
+            }
+        """)
+        self.placeholder_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.placeholder_label.show()
+
+
+        self.btn_collapse = QPushButton("▶")
+        self.btn_collapse.setFixedWidth(24)
+        self.btn_collapse.clicked.connect(self.toggle_menu)
+        ctrl.addWidget(self.btn_collapse, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.is_control_panel_open = True
+        self.toggle_menu(force_open=True)
 
         self.btn_audio = QPushButton('1. Load Audio')
         self.btn_audio.clicked.connect(self.load_audio)
@@ -462,6 +490,26 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(33)
         self.timer.timeout.connect(self.update_loop)
 
+    def toggle_menu(self, force_open=False):
+        is_openning = force_open or self.is_control_panel_open is False
+        self.control_panel.setMaximumWidth(CONTROL_PANEL_WIDTH_OPEN if is_openning else CONTROL_PANEL_WIDTH_CLOSED)
+        self.control_panel.setMinimumWidth(CONTROL_PANEL_WIDTH_OPEN if is_openning else CONTROL_PANEL_WIDTH_CLOSED)
+        self.btn_collapse.setText("▶" if is_openning else "◀")
+        self.__show_or_hide_menu(not is_openning)
+        self.is_control_panel_open = is_openning
+
+    def __show_or_hide_menu(self, hide):
+        for index in range(self.control_panel.layout().count()):
+            _widget = self.control_panel.layout().itemAt(index).widget()
+            if _widget in [None, self.btn_collapse]:
+                continue
+            _widget.setVisible(not hide)
+
+    def __manage_hint(self):
+        is_show = self.audio_path is None or self.video_handler.image is None and not self.video_handler.is_video
+        self.placeholder_label.setVisible(is_show)
+
+
     def load_audio(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Open Audio', filter='WAV (*.wav)')
         if not fname: return
@@ -476,6 +524,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self.update_progress)
         self.worker.error.connect(self.on_error)
         self.worker.start()
+        self.__manage_hint()
 
     def update_progress(self, val): self.progress_bar.setValue(val)
     def on_error(self, msg):
@@ -493,12 +542,14 @@ class MainWindow(QMainWindow):
         self.btn_audio.setEnabled(True)
         self.btn_video.setEnabled(True)
         self.btn_start.setEnabled(True)
+        self.__manage_hint()
 
     def load_video(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Open Video', filter='Video (*.mp4 *.jpg *.png)')
         if not fname: return
         self.video_handler.load(fname)
         self.lbl_status.setText("Video Loaded.")
+        self.__manage_hint()
 
     def toggle_playback(self):
         if self.is_playing:
