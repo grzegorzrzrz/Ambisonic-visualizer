@@ -468,10 +468,23 @@ class MainWindow(QMainWindow):
         self.lbl_status.setWordWrap(True)
         ctrl.addWidget(self.lbl_status)
 
-        self.btn_start = QPushButton('Play')
-        self.btn_start.clicked.connect(self.toggle_playback)
-        self.btn_start.setEnabled(False)
-        ctrl.addWidget(self.btn_start)
+        play_stop_layout = QHBoxLayout()
+        play_stop_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        self.btn_play_stop = QPushButton("▶")
+        self.btn_play_stop.setFixedSize(44, 44)
+        self.btn_play_stop.setStyleSheet("""
+            QPushButton {
+                border-radius: 22px;
+                background: #2ecc71;
+                font-size: 18px;
+            }
+        """)
+        self.btn_play_stop.clicked.connect(self.__manage_play_stop)
+        ctrl.addWidget(self.btn_play_stop)
+        play_stop_layout.addWidget(self.btn_play_stop)
+        ctrl.addLayout(play_stop_layout)
+
 
         self.lbl_time = QLabel("00:00")
         ctrl.addWidget(self.lbl_time)
@@ -499,16 +512,43 @@ class MainWindow(QMainWindow):
         self.is_control_panel_open = is_openning
 
     def __show_or_hide_menu(self, hide):
-        for index in range(self.control_panel.layout().count()):
-            _widget = self.control_panel.layout().itemAt(index).widget()
-            if _widget in [None, self.btn_collapse]:
-                continue
-            _widget.setVisible(not hide)
+        def process_layout(layout):
+            for idx in range(layout.count()):
+                item = layout.itemAt(idx)
+                _widget = item.widget()
+                _layout = item.layout()
+
+                if _widget not in [None, self.btn_collapse]:
+                    _widget.setVisible(not hide)
+                elif _layout:
+                    process_layout(_layout)
+        process_layout(self.control_panel.layout())
+
 
     def __manage_hint(self):
         is_show = self.audio_path is None or self.video_handler.image is None and not self.video_handler.is_video
         self.placeholder_label.setVisible(is_show)
 
+    def __manage_play_stop(self):
+        is_ready = self.audio_path is not None and (self.video_handler.image is not None or self.video_handler.is_video)
+        if not is_ready:
+            return None
+
+        if not self.is_playing:
+            if self.audio_player is None:
+                self.audio_player = AudioPlayer(self.audio_path)
+                self.audio_player.start()
+            else:
+                self.audio_player.resume()
+            self.is_playing = True
+            self.timer.start()
+            self.btn_play_stop.setText("■")
+        else:
+            if self.audio_player is not None:
+                self.audio_player.pause()
+            self.is_playing = False
+            self.timer.stop()
+            self.btn_play_stop.setText("▶")
 
     def load_audio(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Open Audio', filter='WAV (*.wav)')
@@ -517,7 +557,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Processing Audio...")
         self.btn_audio.setEnabled(False)
         self.btn_video.setEnabled(False)
-        self.btn_start.setEnabled(False)
+        self.btn_play_stop.setEnabled(False)
         self.progress_bar.setValue(0)
         self.worker = CalculationWorker(fname, fps=self.fps)
         self.worker.finished.connect(self.on_audio_ready)
@@ -541,7 +581,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Audio Processed. You may now load a video.")
         self.btn_audio.setEnabled(True)
         self.btn_video.setEnabled(True)
-        self.btn_start.setEnabled(True)
+        self.btn_play_stop.setEnabled(True)
         self.__manage_hint()
 
     def load_video(self):
@@ -556,7 +596,7 @@ class MainWindow(QMainWindow):
             self.is_playing = False
             self.timer.stop()
             if self.audio_player: self.audio_player.pause()
-            self.btn_start.setText("Play")
+            self.btn_play_stop.setText("Play")
         else:
             if not self.audio_path: return
             if not self.audio_player:
@@ -566,7 +606,7 @@ class MainWindow(QMainWindow):
                 self.audio_player.resume()
             self.is_playing = True
             self.timer.start()
-            self.btn_start.setText("Pause")
+            self.btn_play_stop.setText("Pause")
 
     def update_loop(self):
         if not self.is_playing: return
@@ -586,6 +626,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.audio_player: self.audio_player.stop()
         if self.worker: self.worker.terminate()
+        self.is_playing = False
         event.accept()
 
 def main():
