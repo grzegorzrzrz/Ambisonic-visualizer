@@ -9,7 +9,6 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 from OpenGL.GLU import gluPerspective, gluLookAt
 
-# --- ULEPSZONA FUNKCJA GENEROWANIA SFERY ---
 def create_sphere_mesh_fast(radius, slices, stacks):
     vertices = []
     uvs = []
@@ -18,25 +17,15 @@ def create_sphere_mesh_fast(radius, slices, stacks):
         lat = np.pi * (-0.5 + float(i) / stacks)
         y0 = np.sin(lat)
         zr = np.cos(lat)
-
-        # Wymuszenie zera na biegunach
-        if i == 0 or i == stacks:
-            zr = 0.0
+        if i == 0 or i == stacks: zr = 0.0
 
         for j in range(slices + 1):
             lng = 2 * np.pi * float(j) / slices
             x0 = zr * np.cos(lng)
             z0 = zr * np.sin(lng)
-
-            # Kolejność osi Y-up: [x, y, z]
             vertices.append([x0 * radius, y0 * radius, z0 * radius])
-
-            # --- POPRAWKA LUSTRZANEGO ODBICIA ---
-            # Usunięto "1.0 - " dla współrzędnej U.
-            # Teraz tekstura mapuje się normalnie od lewej do prawej.
-            u = float(j) / slices
             
-            # V nadal odwrócone, bo OpenGL ładuje obrazy do góry nogami
+            u = float(j) / slices # Bez "1.0 - " (naprawa lustrzanego odbicia)
             v = 1.0 - (float(i) / stacks) 
             uvs.append([u, v])
 
@@ -56,8 +45,6 @@ def create_sphere_mesh_fast(radius, slices, stacks):
     indices = np.array(indices, dtype=np.uint32)
     return vertices, uvs, indices
 
-
-# --- Video Handler Class ---
 class VideoHandler:
     def __init__(self):
         self.cap = None
@@ -73,42 +60,30 @@ class VideoHandler:
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.is_video = True
             return True
-        
         img = cv2.imread(path)
         if img is not None:
             self.is_video = False
-            # Konwersja BGR -> RGB
             self.image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            # Opcjonalnie: odkomentuj, jeśli statyczne obrazy są do góry nogami
-            # self.image = cv2.flip(self.image, 0) 
             return True
         return False
 
     def get_frame(self, t_sec):
         if not self.is_video: return self.image
-        
         target = int(t_sec * self.fps)
         if target >= self.frame_count: target = target % self.frame_count
-        
         curr = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
-        if abs(curr - target) > 5: 
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-        
+        if abs(curr - target) > 5: self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
         ret, frame = self.cap.read()
         if ret: return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = self.cap.read()
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
 
-
-# --- OpenGL Widget Class ---
 class FPSGLWidget(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_obj = parent 
-        self.energy_frames = None
-        self.max_energy = 1.0
+        self.max_energy = 0.5 # Domyślna czułość (auto-kalibracja mile widziana)
         self.sharpness = 1.0
         self.slices = 80 
         self.stacks = 60
@@ -123,10 +98,8 @@ class FPSGLWidget(QOpenGLWidget):
         self.sensitivity = 0.2
         self.fov = 100.0
         self.texture_id = None
-        try:
-            self.cmap = colormaps['jet']
-        except:
-            self.cmap = plt.get_cmap('jet')
+        try: self.cmap = colormaps['jet']
+        except: self.cmap = plt.get_cmap('jet')
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
@@ -134,15 +107,12 @@ class FPSGLWidget(QOpenGLWidget):
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glClearColor(0.0, 0.0, 0.0, 1.0)
-        
         self.texture_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
-        
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP)
-        
         self.verts, self.uvs, self.indices = create_sphere_mesh_fast(50.0, self.slices, self.stacks)
 
     def prepare_mesh_mapping(self, audio_xyz_coords):
@@ -160,11 +130,22 @@ class FPSGLWidget(QOpenGLWidget):
         h, w, c = img_data.shape
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
 
-    def set_energy_data(self, energy_array):
+    def set_energy_data(self, energy_snapshot):
+        """Odbiera obliczoną energię z wątku audio w czasie rzeczywistym"""
         if self.vertex_indices is None: return
-        mesh_energies = energy_array[self.vertex_indices]
+        
+        # Mapowanie punktów obliczeń na siatkę sfery
+        mesh_energies = energy_snapshot[self.vertex_indices]
+        
+        # Prosta auto-kalibracja max_energy (zanikanie powolne)
+        curr_max = np.max(mesh_energies)
+        if curr_max > self.max_energy:
+            self.max_energy = curr_max
+        else:
+            self.max_energy *= 0.99 # Powolny powrót
+            
         norm_e = np.clip(mesh_energies / (self.max_energy + 1e-9), 0.0, 1.0)
-        sharpened_e = np.power(norm_e, np.sqrt(self.sharpness))
+        sharpened_e = np.power(norm_e, self.sharpness)
         rgba = self.cmap(sharpened_e)
         rgba[:, 3] = rgba[:, 3] * sharpened_e * 0.9 
         self.colors = np.ascontiguousarray(rgba, dtype=np.float32)
@@ -183,18 +164,14 @@ class FPSGLWidget(QOpenGLWidget):
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
-        
         rad_yaw = np.radians(self.yaw)
         rad_pitch = np.radians(self.pitch)
-        
         look_x = np.cos(rad_yaw) * np.cos(rad_pitch)
         look_y = np.sin(rad_pitch)
         look_z = np.sin(rad_yaw) * np.cos(rad_pitch)
-        
         gluLookAt(0, 0, 0, look_x, look_y, look_z, 0, 1, 0)
         
         if self.verts is None: return
-        
         glEnableClientState(GL_VERTEX_ARRAY)
         glEnableClientState(GL_TEXTURE_COORD_ARRAY)
         glVertexPointer(3, GL_FLOAT, 0, self.verts)
@@ -218,7 +195,6 @@ class FPSGLWidget(QOpenGLWidget):
             glDisableClientState(GL_COLOR_ARRAY)
             glDisable(GL_BLEND)
             glEnable(GL_DEPTH_TEST)
-
         glDisableClientState(GL_VERTEX_ARRAY)
         glDisableClientState(GL_TEXTURE_COORD_ARRAY)
 

@@ -3,44 +3,26 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QHBoxLayout, QVBoxLayout,
     QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QSlider, QComboBox
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 
-# Importujemy nasze moduły
-from processing import AudioPlayer, calculate_energy_frames
+# Importujemy nowe klasy
+from processing import RealTimeAudioPlayer
 from graphics_engine import FPSGLWidget, VideoHandler
 
 CONTROL_PANEL_WIDTH_OPEN = 240
 CONTROL_PANEL_WIDTH_CLOSED = 30
 
-class CalculationWorker(QThread):
-    finished = pyqtSignal(object, object, float, int, int)
-    progress = pyqtSignal(int)
-    error = pyqtSignal(str)
-    def __init__(self, filename, target_order, fps=30):
-        super().__init__()
-        self.filename = filename
-        self.target_order = target_order
-        self.fps = fps
-    def run(self):
-        try:
-            # Używamy funkcji z processing.py
-            xyz, energy, max_e, fs, n_frames = calculate_energy_frames(
-                self.filename, self.progress.emit, target_order=self.target_order, fps=self.fps
-            )
-            self.finished.emit(xyz, energy, max_e, fs, n_frames)
-        except Exception as e:
-            self.error.emit(str(e))
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Immersive Ambisonic Visualizer')
+        self.setWindowTitle('Real-Time Ambisonic Visualizer')
         self.resize(1200, 800)
+        
+        # --- UI SETUP ---
         cw = QWidget()
         self.setCentralWidget(cw)
         layout = QHBoxLayout(cw)
         
-        # Tworzymy widget OpenGL z graphics_engine.py
         self.glw = FPSGLWidget(self)
         layout.addWidget(self.glw)
 
@@ -50,7 +32,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.glw)
         layout.addWidget(self.control_panel)
         
-        self.placeholder_label = QLabel("Select files in menu", self.glw)
+        self.placeholder_label = QLabel("Load Audio/Video to start", self.glw)
         self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.placeholder_label.setStyleSheet("""
             QLabel { color: #aaaaaa; font-size: 24px; background: transparent; }
@@ -69,16 +51,11 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(lbl_order)
         self.combo_order = QComboBox()
         self.combo_order.addItems(["Auto (Max)", "1st Order (4 ch)", "2nd Order (9 ch)", "3rd Order (16 ch)"])
-        self.combo_order.currentIndexChanged.connect(self.on_order_changed)
         ctrl.addWidget(self.combo_order)
 
         self.btn_audio = QPushButton('1. Load Audio')
         self.btn_audio.clicked.connect(self.load_audio)
         ctrl.addWidget(self.btn_audio)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        ctrl.addWidget(self.progress_bar)
 
         self.btn_video = QPushButton('2. Load Video')
         self.btn_video.clicked.connect(self.load_video)
@@ -116,29 +93,21 @@ class MainWindow(QMainWindow):
         play_stop_layout.addWidget(self.btn_play_stop)
         ctrl.addLayout(play_stop_layout)
 
-        self.audio_progress = QProgressBar()
-        self.audio_progress.setRange(0, 1000)
-        self.audio_progress.setTextVisible(False)
-        self.audio_progress.setFixedHeight(6)
-        self.audio_progress.setStyleSheet("QProgressBar { background: #333; border-radius: 3px; } QProgressBar::chunk { background: #2ecc71; border-radius: 3px; }")
-        ctrl.addWidget(self.audio_progress)
-
         self.lbl_time = QLabel("00:00")
         ctrl.addWidget(self.lbl_time)
         ctrl.addStretch()
 
+        # --- STATE ---
         self.audio_path = None
-        self.worker = None
-        self.audio_player = None
+        self.player = None
         self.video_handler = VideoHandler()
-        self.energy_frames = None
-        self.fps = 30
         self.is_playing = False
-        self.total_frames = 0
         self.update_sharpness(3)
+        
+        # Timer do wideo (audio odświeża się samo przez sygnały)
         self.timer = QTimer()
         self.timer.setInterval(33)
-        self.timer.timeout.connect(self.update_loop)
+        self.timer.timeout.connect(self.update_video_frame)
 
     def toggle_menu(self, force_open=False):
         is_openning = force_open or self.is_control_panel_open is False
@@ -161,83 +130,29 @@ class MainWindow(QMainWindow):
 
     def update_sharpness(self, val): self.glw.set_sharpness(float(val))
     def update_volume(self, val):
-        if self.audio_player: self.audio_player.set_gain(val)
+        if self.player: self.player.set_gain(val)
     
     def update_audio_rotation(self, yaw, pitch):
-        if self.audio_player:
-            self.audio_player.set_view_rotation(yaw, pitch)
-
-    def on_order_changed(self, idx):
-        if self.audio_path:
-            if self.is_playing: self.__manage_play_stop()
-            self.start_processing(self.audio_path)
-
-    def __manage_hint(self):
-        is_show = self.audio_path is None or self.video_handler.image is None and not self.video_handler.is_video
-        self.placeholder_label.setVisible(is_show)
-
-    def __manage_play_stop(self):
-        is_ready = self.audio_path is not None and (self.video_handler.image is not None or self.video_handler.is_video)
-        if not is_ready: return None
-        if not self.is_playing:
-            if self.audio_player is None:
-                self.audio_player = AudioPlayer(self.audio_path)
-                self.audio_player.set_gain(self.slider_volume.value())
-                self.audio_player.start()
-            else: self.audio_player.resume()
-            self.is_playing = True
-            self.timer.start()
-            self.btn_play_stop.setText("■")
-        else:
-            if self.audio_player is not None: self.audio_player.pause()
-            self.is_playing = False
-            self.timer.stop()
-            self.btn_play_stop.setText("▶")
+        if self.player: self.player.set_view_rotation(yaw, pitch)
 
     def load_audio(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Open Audio', filter='WAV (*.wav)')
         if not fname: return
-        self.start_processing(fname)
-
-    def start_processing(self, fname):
+        
+        # Stop existing
+        if self.player: 
+            self.player.stop()
+            self.player.wait()
+            
         self.audio_path = fname
-        self.lbl_status.setText("Processing Audio...")
-        self.btn_audio.setEnabled(False)
-        self.btn_video.setEnabled(False)
-        self.btn_play_stop.setEnabled(False)
-        self.combo_order.setEnabled(False)
-        self.progress_bar.setValue(0)
-        sel_idx = self.combo_order.currentIndex()
-        target_order = None
-        if sel_idx == 1: target_order = 1
-        elif sel_idx == 2: target_order = 2
-        elif sel_idx == 3: target_order = 3
-        self.worker = CalculationWorker(fname, target_order, fps=self.fps)
-        self.worker.finished.connect(self.on_audio_ready)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.error.connect(self.on_error)
-        self.worker.start()
-        self.__manage_hint()
-
-    def update_progress(self, val): self.progress_bar.setValue(val)
-    def on_error(self, msg):
-        QMessageBox.critical(self, "Error", msg)
-        self.lbl_status.setText("Error occurred.")
-        self.btn_audio.setEnabled(True)
-        self.combo_order.setEnabled(True)
-        self.progress_bar.setValue(0)
-
-    def on_audio_ready(self, xyz, energy, max_e, fs, n_frames):
-        self.energy_frames = energy
-        self.total_frames = n_frames
-        self.glw.max_energy = max_e
-        self.glw.prepare_mesh_mapping(xyz)
-        self.lbl_status.setText("Ready. Use headphones.")
-        self.btn_audio.setEnabled(True)
+        self.lbl_status.setText("Audio Selected. Press Play.")
         self.btn_video.setEnabled(True)
         self.btn_play_stop.setEnabled(True)
-        self.combo_order.setEnabled(True)
         self.__manage_hint()
+        
+        # Reset play state
+        self.is_playing = False
+        self.btn_play_stop.setText("▶")
 
     def load_video(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Open Video', filter='Video (*.mp4 *.jpg *.png)')
@@ -245,27 +160,84 @@ class MainWindow(QMainWindow):
         self.video_handler.load(fname)
         self.lbl_status.setText("Video Loaded.")
         self.__manage_hint()
+        # Odśwież jedną klatkę, żeby pokazać wideo od razu
+        self.update_video_frame(force=True)
 
-    def update_loop(self):
-        if not self.is_playing: return
-        t = self.audio_player.get_current_time()
+    def __manage_hint(self):
+        is_show = self.audio_path is None
+        self.placeholder_label.setVisible(is_show)
+
+    def __manage_play_stop(self):
+        if not self.audio_path: return
+
+        if not self.is_playing:
+            # START PLAYBACK
+            if self.player is None or not self.player.isRunning():
+                # Wybór rzędu
+                sel_idx = self.combo_order.currentIndex()
+                target_order = None
+                if sel_idx == 1: target_order = 1
+                elif sel_idx == 2: target_order = 2
+                elif sel_idx == 3: target_order = 3
+
+                # Inicjalizacja nowego odtwarzacza
+                self.player = RealTimeAudioPlayer(self.audio_path, target_order)
+                
+                # Podłączenie sygnałów
+                self.player.mesh_initialized.connect(self.glw.prepare_mesh_mapping)
+                self.player.energy_updated.connect(self.glw.set_energy_data)
+                self.player.error_occurred.connect(self.on_error)
+                self.player.finished_playback.connect(self.on_finished)
+                
+                # Ustawienia początkowe
+                self.player.set_gain(self.slider_volume.value())
+                self.player.start()
+            else:
+                self.player.resume()
+            
+            self.is_playing = True
+            self.timer.start()
+            self.btn_play_stop.setText("■")
+            self.lbl_status.setText("Playing...")
+        else:
+            # PAUSE
+            if self.player: self.player.pause()
+            self.is_playing = False
+            self.timer.stop()
+            self.btn_play_stop.setText("▶")
+            self.lbl_status.setText("Paused")
+
+    def update_video_frame(self, force=False):
+        if not self.player and not force: return
+        
+        # Pobierz czas z audio (master clock)
+        t = 0.0
+        if self.player:
+            t = self.player.get_current_time()
+        
         self.lbl_time.setText(f"{int(t//60):02}:{t%60:05.2f}")
-        if self.total_frames > 0:
-            f_idx = int(t * self.fps) % self.total_frames
-            if self.energy_frames is not None:
-                self.glw.set_energy_data(self.energy_frames[f_idx])
-        if self.video_handler.is_video:
+
+        # Aktualizuj wideo
+        if self.video_handler.is_video or force:
             frame = self.video_handler.get_frame(t)
             self.glw.update_texture(frame)
-        if self.audio_player:
-            duration = self.total_frames / self.fps if self.total_frames else 1.0
-            progress = int((t / duration) * 1000)
-            self.audio_progress.setValue(min(progress, 1000))
+        elif self.video_handler.image is not None and force:
+             self.glw.update_texture(self.video_handler.image)
+
+    def on_error(self, msg):
+        QMessageBox.critical(self, "Error", msg)
+        self.__manage_play_stop() # Reset buttons
+
+    def on_finished(self):
+        self.is_playing = False
+        self.timer.stop()
+        self.btn_play_stop.setText("▶")
+        self.lbl_status.setText("Finished")
 
     def closeEvent(self, event):
-        if self.audio_player: self.audio_player.stop()
-        if self.worker: self.worker.terminate()
-        self.is_playing = False
+        if self.player: 
+            self.player.stop()
+            self.player.wait()
         event.accept()
 
 def main():
