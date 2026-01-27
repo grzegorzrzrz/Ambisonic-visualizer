@@ -1,3 +1,4 @@
+import threading
 import time
 import numpy as np
 import sounddevice as sd
@@ -33,14 +34,10 @@ def get_sh_matrix(coords_sph, max_order):
     return Y
 
 class RealTimeAudioPlayer(QThread):
-    # Sygnały do komunikacji z GUI
-    # 1. Wysyła współrzędne punktów sfery RAZ na początku (do mapowania siatki)
+    # Sygnały
     mesh_initialized = pyqtSignal(object) 
-    # 2. Wysyła obliczoną energię (heatmapę) w każdej klatce audio
     energy_updated = pyqtSignal(object)
-    # 3. Sygnał zakończenia odtwarzania
     finished_playback = pyqtSignal()
-    # 4. Błędy
     error_occurred = pyqtSignal(str)
 
     def __init__(self, filename, target_order=None):
@@ -57,7 +54,7 @@ class RealTimeAudioPlayer(QThread):
         self.gain = 1.0 
         self.current_yaw = -90.0
         self.current_pitch = 0.0
-        self.n_points_viz = 1024 # Mniej punktów dla real-time (szybkość)
+        self.n_points_viz = 1024 
 
     def set_gain(self, vol_slider_val):
         self.gain = (vol_slider_val / 100.0) * 5.0
@@ -79,13 +76,13 @@ class RealTimeAudioPlayer(QThread):
 
     def run(self):
         try:
-            # 1. Wczytywanie pliku (Streaming)
+            # 1. Wczytywanie pliku
             f = sf.SoundFile(self.filename)
             fs = f.samplerate
             n_channels = f.channels
             total_samples = len(f)
             
-            # Walidacja rzędu
+            # Walidacja
             max_possible_order = int(np.sqrt(n_channels) - 1)
             if max_possible_order < 1 and n_channels < 4:
                 self.error_occurred.emit(f"Not enough channels (min 4). Found: {n_channels}")
@@ -98,65 +95,68 @@ class RealTimeAudioPlayer(QThread):
 
             channels_used = (order + 1) ** 2
             
-            # 2. Inicjalizacja Matematyki Wizualizacji (RAZ)
-            sampling = pf.samplings.sph_equal_area(self.n_points_viz)
-            xyz_coords = sampling.cartesian
+            # 2. Inicjalizacja Matematyki
+            sampling = pf.samplings.sph_equal_area(self.n_points_viz, radius=5.0)
+            xyz_coords = sampling.cartesian # Oryginał: [X, Y, Z] gdzie Z to góra
             sph_coords = np.column_stack((sampling.azimuth, sampling.elevation, sampling.radius))
             
-            # Generujemy macierz SH
+            # --- NAPRAWA OSII WIZUALNYCH ---
+            # PyFar: X=Przód, Y=Lewo, Z=Góra
+            # OpenGL: X=Lewo, Y=Góra, Z=Przód
+            # Musimy zamienić kolorymacji, aby Audio Z (Góra) trafiło do OpenGL Y (Góra)
+            
+            # Nowy układ dla grafiki: [Audio_Y, Audio_Z, Audio_X]
+            # Dzięki temu:
+            # - OpenGL X (poziom) dostaje Audio Y (lewo/prawo) -> OK
+            # - OpenGL Y (pion)   dostaje Audio Z (góra/dół)   -> NAPRAWA PROBLEMU
+            # - OpenGL Z (głębia) dostaje Audio X (przód/tył)  -> OK
+            
+            # Dodatkowo negujemy X (Audio_Y), aby dopasować kierunek obrotu wideo
+            xyz_visuals = np.column_stack((
+                -xyz_coords[:, 1], # Audio Y -> GL X (Lewo/Prawo)
+                xyz_coords[:, 2],  # Audio Z -> GL Y (Góra/Dół) - TO JEST KLUCZOWE
+                xyz_coords[:, 0]   # Audio X -> GL Z (Przód/Tył)
+            ))
+            
+            # Generujemy macierz SH na podstawie ORYGINALNYCH współrzędnych sferycznych (matematyka się zgadza)
             Y_matrix = get_sh_matrix(sph_coords, order)
             
-            # Wysyłamy koordynaty do GUI, żeby przygotowało siatkę
-            self.mesh_initialized.emit(xyz_coords)
+            # Wysyłamy PRZEMAPOWANE koordynaty do wizualizacji
+            self.mesh_initialized.emit(xyz_visuals)
 
-            # 3. Pętla przetwarzania (Block-wise)
-            blocksize = 1024 # 1024 próbki to ok. 21ms (bardzo responsywne)
+            # 3. Pętla przetwarzania
+            blocksize = 1024 
             
-            # Otwieramy strumień audio
             with sd.OutputStream(samplerate=fs, channels=2, blocksize=blocksize, dtype='float32') as stream:
                 self.is_running = True
                 self.start_time = time.time()
 
-                # Czytamy plik blokami, zamiast ładować cały do RAM
-                # To tutaj w przyszłości wepniesz: data = stream_input.read()
                 for block in f.blocks(blocksize=blocksize, dtype='float32', always_2d=True):
                     if self._stop_event: break
                     
                     while self._pause_event:
-                        sd.sleep(10) # 10ms sleep
+                        sd.sleep(10) # 10ms (int)
                         self.start_time = time.time() - self.pause_time
                         if self._stop_event: break
                     
-                    # Aktualizacja zegara
                     current_pos = f.tell()
                     self.pause_time = (current_pos / fs)
-                    # Korekta czasu startu przy pętlach/seekowaniu (prosta wersja)
-                    if current_pos < blocksize * 2: # Jeśli jesteśmy na początku
-                         self.start_time = time.time()
+                    if current_pos < blocksize * 2: self.start_time = time.time()
 
-                    # --- A. OBLICZENIA WIZUALIZACJI (REAL-TIME) ---
-                    # Bierzemy tylko potrzebne kanały do Ambisonics
+                    # --- A. WIZUALIZACJA ---
                     ambi_chunk = block[:, :channels_used]
-                    
-                    # Rzutowanie na sferę: (Samples x Ch) dot (Ch x Points) -> (Samples x Points)
                     pressure = np.dot(ambi_chunk, Y_matrix.T)
-                    
-                    # RMS dla tego krótkiego bloku (uśredniamy czas, zostają punkty)
-                    # To daje nam jedną "klatkę" heatmapy dla tego momentu
                     energy_snapshot = np.sqrt(np.mean(pressure ** 2, axis=0))
-                    
-                    # Wysyłamy dane do GUI!
                     self.energy_updated.emit(energy_snapshot)
 
-                    # --- B. OBLICZENIA SŁUCHAWKOWE (ROTACJA) ---
-                    # Tutaj używamy surowego B-Format (1. rzędu wystarczy do rotacji)
+                    # --- B. DŹWIĘK ---
                     if n_channels >= 4:
                         w = block[:, 0]
                         y = block[:, 1]
                         z = block[:, 2]
                         x = block[:, 3]
 
-                        theta = np.radians(-(self.current_yaw + 90))
+                        theta = np.radians((self.current_yaw + 90))
                         cos_t = np.cos(theta)
                         sin_t = np.sin(theta)
 
@@ -172,11 +172,9 @@ class RealTimeAudioPlayer(QThread):
                     else:
                         out_stereo = np.column_stack((block, block))
 
-                    # Gain
                     out_stereo = out_stereo * self.gain
                     np.clip(out_stereo, -1.0, 1.0, out=out_stereo)
                     
-                    # Odtwarzanie
                     stream.write(out_stereo.astype(np.float32))
 
             self.finished_playback.emit()
