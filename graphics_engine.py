@@ -1,6 +1,6 @@
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 from matplotlib import colormaps
 from scipy.spatial import cKDTree
 
@@ -21,12 +21,12 @@ def create_sphere_mesh_fast(radius, slices, stacks):
 
         for j in range(slices + 1):
             lng = 2 * np.pi * float(j) / slices
-            x0 = zr * np.cos(lng)
-            z0 = zr * np.sin(lng)
+            x0 = zr * np.sin(lng)
+            z0 = -zr * np.cos(lng)
             vertices.append([x0 * radius, y0 * radius, z0 * radius])
-            
+
             u = float(j) / slices # Bez "1.0 - " (naprawa lustrzanego odbicia)
-            v = 1.0 - (float(i) / stacks) 
+            v = 1.0 - (float(i) / stacks)
             uvs.append([u, v])
 
     vertices = np.array(vertices, dtype=np.float32)
@@ -82,17 +82,17 @@ class VideoHandler:
 class FPSGLWidget(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent_obj = parent 
+        self.parent_obj = parent
         self.max_energy = 0.5 # Domyślna czułość (auto-kalibracja mile widziana)
         self.sharpness = 1.0
-        self.slices = 80 
+        self.slices = 80
         self.stacks = 60
         self.verts = None
         self.uvs = None
         self.indices = None
         self.vertex_indices = None
         self.colors = None
-        self.yaw = -90.0
+        self.yaw = 0.0
         self.pitch = 0.0
         self.lastPos = QPoint()
         self.sensitivity = 0.2
@@ -133,21 +133,21 @@ class FPSGLWidget(QOpenGLWidget):
     def set_energy_data(self, energy_snapshot):
         """Odbiera obliczoną energię z wątku audio w czasie rzeczywistym"""
         if self.vertex_indices is None: return
-        
+
         # Mapowanie punktów obliczeń na siatkę sfery
         mesh_energies = energy_snapshot[self.vertex_indices]
-        
+
         # Prosta auto-kalibracja max_energy (zanikanie powolne)
         curr_max = np.max(mesh_energies)
         if curr_max > self.max_energy:
             self.max_energy = curr_max
         else:
             self.max_energy *= 0.99 # Powolny powrót
-            
+
         norm_e = np.clip(mesh_energies / (self.max_energy + 1e-9), 0.0, 1.0)
         sharpened_e = np.power(norm_e, self.sharpness)
         rgba = self.cmap(sharpened_e)
-        rgba[:, 3] = rgba[:, 3] * sharpened_e * 0.9 
+        rgba[:, 3] = rgba[:, 3] * sharpened_e * 0.9
         self.colors = np.ascontiguousarray(rgba, dtype=np.float32)
         self.update()
 
@@ -164,13 +164,13 @@ class FPSGLWidget(QOpenGLWidget):
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
-        rad_yaw = np.radians(self.yaw)
+        rad_yaw = np.radians(self.yaw - 90.0)
         rad_pitch = np.radians(self.pitch)
         look_x = np.cos(rad_yaw) * np.cos(rad_pitch)
         look_y = np.sin(rad_pitch)
         look_z = np.sin(rad_yaw) * np.cos(rad_pitch)
         gluLookAt(0, 0, 0, look_x, look_y, look_z, 0, 1, 0)
-        
+
         if self.verts is None: return
         glEnableClientState(GL_VERTEX_ARRAY)
         glEnableClientState(GL_TEXTURE_COORD_ARRAY)
@@ -188,7 +188,7 @@ class FPSGLWidget(QOpenGLWidget):
             glEnable(GL_BLEND)
             glEnableClientState(GL_COLOR_ARRAY)
             glPushMatrix()
-            glScalef(0.99, 0.99, 0.99) 
+            glScalef(0.99, 0.99, 0.99)
             glColorPointer(4, GL_FLOAT, 0, self.colors)
             glDrawElements(GL_QUADS, len(self.indices), GL_UNSIGNED_INT, self.indices)
             glPopMatrix()
